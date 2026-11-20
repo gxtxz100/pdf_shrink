@@ -7,9 +7,9 @@ on:
   workflow_dispatch:
     inputs:
       tag:
-        description: "Release tag (e.g. v1.1.0)"
+        description: "Release tag (e.g. v1.1.1)"
         required: false
-        default: "v1.1.0"
+        default: "v1.1.1"
 
 permissions:
   contents: write
@@ -33,14 +33,16 @@ jobs:
           python -m pip install --upgrade pip
           pip install --prefer-binary -r requirements.txt pyinstaller
 
-      - name: Generate icon
+      - name: Generate icon & Windows version info
         shell: pwsh
-        run: python scripts/make_icons.py
+        run: |
+          python scripts/make_icons.py
+          python scripts/make_win_version_info.py
 
       - name: Smoke test core compression & tkinterdnd2
         shell: pwsh
         run: |
-          python -c "import pymupdf, PIL, tkinterdnd2, pdf_shrink; print('Windows imports OK')"
+          python -c "import pymupdf, PIL, tkinterdnd2, pdf_shrink; print('Windows imports OK:', pdf_shrink.APP_VERSION, pdf_shrink.APP_COPYRIGHT)"
 
       - name: Build Windows single-file .exe
         shell: pwsh
@@ -52,6 +54,7 @@ jobs:
             --windowed `
             --name "PDF-Shrink-Windows-x64" `
             --icon "assets/icon.ico" `
+            --version-file "assets/win_version_info.txt" `
             --collect-all tkinterdnd2 `
             --exclude-module pytest `
             --exclude-module unittest `
@@ -81,11 +84,13 @@ jobs:
           - label: Apple Silicon (M芯片 arm64)
             os: macos-15
             arch: arm64
-            artifact: PDF-Shrink-macOS-AppleSilicon-arm64.zip
+            min_macos: "11.0"
+            dmg_name: PDF-Shrink-macOS-AppleSilicon-arm64.dmg
           - label: Intel (x86_64)
             os: macos-15-intel
             arch: x86_64
-            artifact: PDF-Shrink-macOS-Intel-x86_64.zip
+            min_macos: "10.15"
+            dmg_name: PDF-Shrink-macOS-Intel-x86_64.dmg
     runs-on: ${{ matrix.os }}
     steps:
       - name: Checkout
@@ -155,11 +160,31 @@ jobs:
             --exclude-module sqlite3 \
             pdf_shrink.py
 
-      - name: Configure Info.plist, verify arch, ad-hoc sign, and zip
+      - name: Configure Info.plist, sign .app, package .dmg, and verify
+        env:
+          MACOS_CERTIFICATE_BASE64: ${{ secrets.MACOS_CERTIFICATE_BASE64 }}
+          MACOS_CERTIFICATE_PASSWORD: ${{ secrets.MACOS_CERTIFICATE_PASSWORD }}
+          APPLE_ID: ${{ secrets.APPLE_ID }}
+          APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
+          APPLE_APP_SPECIFIC_PASSWORD: ${{ secrets.APPLE_APP_SPECIFIC_PASSWORD }}
         run: |
-          PLIST="dist/PDF Shrink.app/Contents/Info.plist"
-          /usr/libexec/PlistBuddy -c "Add :CFBundleShortVersionString string 1.1.0" "$PLIST" 2>/dev/null || \
-            /usr/libexec/PlistBuddy -c "Set :CFBundleShortVersionString 1.1.0" "$PLIST"
+          set -euo pipefail
+          source .venv/bin/activate
+
+          APP="dist/PDF Shrink.app"
+          PLIST="$APP/Contents/Info.plist"
+          APP_VER=$(python -c "import pdf_shrink; print(pdf_shrink.APP_VERSION)")
+          APP_COPYRIGHT=$(python -c "import pdf_shrink; print(pdf_shrink.APP_COPYRIGHT)")
+          MIN_MACOS="${{ matrix.min_macos }}"
+
+          /usr/libexec/PlistBuddy -c "Add :CFBundleShortVersionString string $APP_VER" "$PLIST" 2>/dev/null || \
+            /usr/libexec/PlistBuddy -c "Set :CFBundleShortVersionString $APP_VER" "$PLIST"
+          /usr/libexec/PlistBuddy -c "Add :CFBundleVersion string $APP_VER" "$PLIST" 2>/dev/null || \
+            /usr/libexec/PlistBuddy -c "Set :CFBundleVersion $APP_VER" "$PLIST"
+          /usr/libexec/PlistBuddy -c "Add :NSHumanReadableCopyright string $APP_COPYRIGHT" "$PLIST" 2>/dev/null || \
+            /usr/libexec/PlistBuddy -c "Set :NSHumanReadableCopyright $APP_COPYRIGHT" "$PLIST"
+          /usr/libexec/PlistBuddy -c "Add :LSMinimumSystemVersion string $MIN_MACOS" "$PLIST" 2>/dev/null || \
+            /usr/libexec/PlistBuddy -c "Set :LSMinimumSystemVersion $MIN_MACOS" "$PLIST"
           /usr/libexec/PlistBuddy -c "Add :NSHighResolutionCapable bool true" "$PLIST" 2>/dev/null || \
             /usr/libexec/PlistBuddy -c "Set :NSHighResolutionCapable true" "$PLIST"
           /usr/libexec/PlistBuddy -c "Add :CFBundleDocumentTypes array" "$PLIST" 2>/dev/null || true
@@ -170,22 +195,252 @@ jobs:
           /usr/libexec/PlistBuddy -c "Add :CFBundleDocumentTypes:0:LSItemContentTypes:0 string com.adobe.pdf" "$PLIST" 2>/dev/null || true
           /usr/libexec/PlistBuddy -c "Add :CFBundleDocumentTypes:0:LSItemContentTypes:1 string public.folder" "$PLIST" 2>/dev/null || true
 
-          echo "=== Verify binary architecture ==="
-          lipo -info "dist/PDF Shrink.app/Contents/MacOS/PDF Shrink"
+          chmod +x "$APP/Contents/MacOS/PDF Shrink"
 
-          echo "=== Ad-hoc code sign ==="
-          codesign --force --deep --sign - "dist/PDF Shrink.app"
-          codesign --verify --deep --strict "dist/PDF Shrink.app"
+          echo "=== Code sign inside-out ==="
+          SIGN_IDENTITY="-"
+          TEMP_KEYCHAIN=""
+          USE_DEVELOPER_ID=0
+          NOTARIZED=0
 
-          echo "=== Package zip ==="
-          ditto -c -k --sequesterRsrc --keepParent "dist/PDF Shrink.app" "dist/${{ matrix.artifact }}"
-          ls -lh "dist/${{ matrix.artifact }}"
+          cleanup() {
+            hdiutil detach "/tmp/verify_dmg" -force 2>/dev/null || true
+            if [[ -n "$TEMP_KEYCHAIN" ]]; then
+              security delete-keychain "$TEMP_KEYCHAIN" 2>/dev/null || true
+            fi
+            rm -f /tmp/cert.p12
+          }
+          trap cleanup EXIT
+
+          if [[ -n "${MACOS_CERTIFICATE_BASE64:-}" && -n "${MACOS_CERTIFICATE_PASSWORD:-}" ]]; then
+            echo "Importing Developer ID Application certificate..."
+            TEMP_KEYCHAIN="/tmp/build-signing.keychain-db"
+            KEYCHAIN_PASS="temp-build-pass-$$"
+            echo "$MACOS_CERTIFICATE_BASE64" | base64 --decode > /tmp/cert.p12
+            security create-keychain -p "$KEYCHAIN_PASS" "$TEMP_KEYCHAIN"
+            security set-keychain-settings -lut 21600 "$TEMP_KEYCHAIN"
+            security unlock-keychain -p "$KEYCHAIN_PASS" "$TEMP_KEYCHAIN"
+            # 确保 Apple Developer ID G2 中间证书存在，避免证书链校验警告或公证失败
+            curl -fsSL -o /tmp/DeveloperIDG2CA.cer https://www.apple.com/certificateauthority/DeveloperIDG2CA.cer
+            security import /tmp/DeveloperIDG2CA.cer -k "$TEMP_KEYCHAIN" -T /usr/bin/codesign || true
+            rm -f /tmp/DeveloperIDG2CA.cer
+            security import /tmp/cert.p12 -P "$MACOS_CERTIFICATE_PASSWORD" -A -t cert -f pkcs12 -k "$TEMP_KEYCHAIN" -T /usr/bin/codesign -T /usr/bin/security
+            security list-keychains -d user -s "$TEMP_KEYCHAIN" login.keychain-db
+            security default-keychain -s "$TEMP_KEYCHAIN"
+            security set-key-partition-list -S apple-tool:,apple:,codesign: -s -k "$KEYCHAIN_PASS" "$TEMP_KEYCHAIN"
+            SIGN_IDENTITY=$(security find-identity -v -p codesigning "$TEMP_KEYCHAIN" | grep "Developer ID Application" | head -n 1 | sed -E 's/.*"([^"]+)".*/\1/' || true)
+            if [[ -z "$SIGN_IDENTITY" ]]; then
+              echo "ERROR: No Developer ID Application identity found in certificate." >&2
+              security find-identity -p codesigning "$TEMP_KEYCHAIN" || true
+              exit 1
+            fi
+            USE_DEVELOPER_ID=1
+            echo "Using signing identity: $SIGN_IDENTITY"
+          else
+            echo "No Developer ID certificate configured; using inside-out ad-hoc signing."
+          fi
+
+          sign_item() {
+            if [[ "$USE_DEVELOPER_ID" -eq 1 ]]; then
+              codesign --force --timestamp --options runtime --entitlements scripts/entitlements.plist --keychain "$TEMP_KEYCHAIN" --sign "$SIGN_IDENTITY" "$1"
+            else
+              codesign --force --sign - "$1"
+            fi
+          }
+
+          # 1. 签名所有独立动态库 (.so / .dylib)
+          while IFS= read -r -d '' bin; do
+            sign_item "$bin"
+          done < <(find "$APP/Contents/Frameworks" -type f \( -name "*.so" -o -name "*.dylib" \) -print0)
+
+          # 2. 签名嵌套的 Python.framework
+          if [[ -d "$APP/Contents/Frameworks/Python.framework" ]]; then
+            for ver_dir in "$APP/Contents/Frameworks/Python.framework/Versions"/*; do
+              [[ -L "$ver_dir" || ! -d "$ver_dir" ]] && continue
+              if [[ -f "$ver_dir/Python" ]]; then
+                sign_item "$ver_dir/Python"
+              fi
+            done
+            sign_item "$APP/Contents/Frameworks/Python.framework"
+          fi
+
+          # 3. 签名主可执行文件与外层 .app 包
+          sign_item "$APP/Contents/MacOS/PDF Shrink"
+          sign_item "$APP"
+          codesign --verify --deep --strict --verbose=2 "$APP"
+
+          echo "=== Package DMG (${{ matrix.dmg_name }}) ==="
+          STAGE="dist/dmg_stage"
+          DMG_PATH="dist/${{ matrix.dmg_name }}"
+          rm -rf "$STAGE" "$DMG_PATH"
+          mkdir -p "$STAGE"
+
+          ditto "$APP" "$STAGE/PDF Shrink.app"
+          ln -s /Applications "$STAGE/Applications"
+
+          if [[ "$USE_DEVELOPER_ID" -eq 1 && -n "${APPLE_ID:-}" && -n "${APPLE_TEAM_ID:-}" && -n "${APPLE_APP_SPECIFIC_PASSWORD:-}" ]]; then
+            cat > "$STAGE/使用说明.txt" <<EOF
+          PDF Shrink v${APP_VER}（广西瀛桂律师事务所专用版）— macOS 安装说明
+          ${APP_COPYRIGHT}
+          ================================================================
+
+          【安装方式】
+          将「PDF Shrink.app」拖入旁边的「Applications（应用程序）」文件夹即可双击使用。
+          本安装包已通过 Apple Developer ID 正式签名与公证。
+
+          【重要提示：如需转发给同事或存入百度网盘同步空间】
+          请直接保存或转发本 .dmg 安装镜像单文件，切勿把拖出来后的「PDF Shrink.app」放进
+          百度网盘同步空间、微信文件夹或 Windows 电脑中转（网盘/Windows 会丢失 macOS 应用
+          内部的符号链接与可执行权限，导致应用损坏无法打开）。
+          EOF
+          else
+            cat > "$STAGE/首次打开说明.txt" <<EOF
+          PDF Shrink v${APP_VER}（广西瀛桂律师事务所专用版）— macOS 安装与首次打开说明
+          ${APP_COPYRIGHT}
+          ================================================================
+
+          【安装方式】
+          将「PDF Shrink.app」拖入旁边的「Applications（应用程序）」文件夹即可完成安装。
+
+          【重要提示：如需转发给同事或存入百度网盘同步空间】
+          请直接保存或转发本 .dmg 安装镜像单文件，切勿把拖出来后的「PDF Shrink.app」放进
+          百度网盘同步空间、微信文件夹或 Windows 电脑中转（网盘/Windows 会丢失 macOS 应用
+          内部的符号链接与可执行权限，导致应用彻底损坏无法打开）。
+
+          【首次打开提示处理（适用于 macOS 15 Sequoia / macOS 26 及以上）】
+          如未经过 Apple 在线公证，首次双击可能弹出：
+          “Apple 无法验证‘PDF Shrink’不包含可能损害你 Mac 或危及隐私的恶意软件”
+          （注意：macOS 15 起苹果已移除“右键 → 打开”绕过方式）
+
+          请按以下步骤操作（仅首次需要，之后永久直接双击打开）：
+            1. 在弹窗中点击「完成」（切勿点“移到废纸篓”）；
+            2. 打开「系统设置」→「隐私与安全性」；
+            3. 向下滚动到页面底部的「安全性」区域，点击「仍要打开」；
+            4. 输入开机密码或验证指纹即可打开。
+
+          【备选：终端一行命令放行】
+            xattr -dr com.apple.quarantine "/Applications/PDF Shrink.app"
+          EOF
+          fi
+
+          for attempt in 1 2 3; do
+            if hdiutil create \
+              -volname "PDF Shrink" \
+              -srcfolder "$STAGE" \
+              -ov \
+              -fs HFS+ \
+              -format UDZO \
+              -imagekey zlib-level=9 \
+              "$DMG_PATH"; then
+              break
+            fi
+            echo "hdiutil create attempt $attempt failed, retrying in 3s..."
+            sleep 3
+            [[ $attempt -eq 3 ]] && exit 1
+          done
+
+          if [[ "$USE_DEVELOPER_ID" -eq 1 ]]; then
+            codesign --force --timestamp --keychain "$TEMP_KEYCHAIN" --sign "$SIGN_IDENTITY" "$DMG_PATH"
+            APPLE_ID_CLEAN=$(printf '%s' "${APPLE_ID:-}" | tr -d '[:space:]')
+            APPLE_TEAM_ID_CLEAN=$(printf '%s' "${APPLE_TEAM_ID:-}" | tr -d '[:space:]')
+            APPLE_PW_CLEAN=$(printf '%s' "${APPLE_APP_SPECIFIC_PASSWORD:-}" | tr -d '[:space:]')
+            if [[ -n "$APPLE_ID_CLEAN" && -n "$APPLE_TEAM_ID_CLEAN" && -n "$APPLE_PW_CLEAN" ]]; then
+              echo "Submitting DMG for Apple Notarization..."
+              set +e
+              xcrun notarytool submit "$DMG_PATH" \
+                --apple-id "$APPLE_ID_CLEAN" \
+                --team-id "$APPLE_TEAM_ID_CLEAN" \
+                --password "$APPLE_PW_CLEAN" \
+                --wait \
+                --output-format json > /tmp/notary_result.json
+              NOTARY_RC=$?
+              set -e
+              cat /tmp/notary_result.json
+              SUBMISSION_ID=$(python -c "import json; d=json.load(open('/tmp/notary_result.json')); print(d.get('id',''))" 2>/dev/null || true)
+              NOTARY_STATUS=$(python -c "import json; d=json.load(open('/tmp/notary_result.json')); print(d.get('status',''))" 2>/dev/null || true)
+              if [[ "$NOTARY_RC" -ne 0 || "$NOTARY_STATUS" != "Accepted" ]]; then
+                echo "ERROR: Apple Notarization failed (rc=$NOTARY_RC, status=$NOTARY_STATUS)" >&2
+                if [[ -n "$SUBMISSION_ID" ]]; then
+                  xcrun notarytool log "$SUBMISSION_ID" \
+                    --apple-id "$APPLE_ID_CLEAN" \
+                    --team-id "$APPLE_TEAM_ID_CLEAN" \
+                    --password "$APPLE_PW_CLEAN" || true
+                fi
+                exit 1
+              fi
+              xcrun stapler staple "$DMG_PATH"
+              xcrun stapler validate "$DMG_PATH"
+              NOTARIZED=1
+            fi
+          fi
+
+          ls -lh "$DMG_PATH"
+
+          echo "=== End-to-end verification from mounted DMG ==="
+          MOUNT_DIR="/tmp/verify_dmg"
+          mkdir -p "$MOUNT_DIR"
+          hdiutil attach -nobrowse -readonly -mountpoint "$MOUNT_DIR" "$DMG_PATH"
+
+          MOUNTED_APP="$MOUNT_DIR/PDF Shrink.app"
+          test -x "$MOUNTED_APP/Contents/MacOS/PDF Shrink"
+          SYMLINK_COUNT=$(find "$MOUNTED_APP" -type l | wc -l | tr -d ' ')
+          echo "Symlinks preserved in mounted DMG: $SYMLINK_COUNT"
+          test "$SYMLINK_COUNT" -gt 0
+
+          codesign --verify --deep --strict --verbose=2 "$MOUNTED_APP"
+          if [[ "$NOTARIZED" -eq 1 ]]; then
+            spctl --assess --type execute --verbose=4 "$MOUNTED_APP"
+          fi
+
+          python -c '
+          import pathlib, subprocess, sys
+          app = pathlib.Path(sys.argv[1])
+          expected = sys.argv[2]
+          checked = 0
+          for p in app.rglob("*"):
+              if not p.is_file() or p.is_symlink():
+                  continue
+              r = subprocess.run(["lipo", "-archs", str(p)], capture_output=True, text=True)
+              if r.returncode != 0:
+                  continue
+              checked += 1
+              archs = r.stdout.strip().split()
+              assert expected in archs, f"Arch mismatch in {p}: {archs} (expected {expected})"
+          print(f"Verified {checked} Mach-O binaries match arch={expected}")
+          ' "$MOUNTED_APP" "${{ matrix.arch }}"
+
+          "$MOUNTED_APP/Contents/MacOS/PDF Shrink" --version
+
+          python -c '
+          import io, pathlib, subprocess, tempfile
+          import pymupdf
+          from PIL import Image
+
+          tmp = pathlib.Path(tempfile.mkdtemp())
+          src = tmp / "ci_test.pdf"
+          out = tmp / "ci_out.pdf"
+          doc = pymupdf.open()
+          img = Image.new("RGB", (1400, 1800), (235, 235, 235))
+          buf = io.BytesIO()
+          img.save(buf, format="JPEG", quality=96)
+          p = doc.new_page(width=595, height=842)
+          p.insert_image(p.rect, stream=buf.getvalue())
+          doc.save(src)
+          doc.close()
+
+          exe = "/tmp/verify_dmg/PDF Shrink.app/Contents/MacOS/PDF Shrink"
+          subprocess.run([exe, str(src), "-o", str(out), "-p", "high"], check=True)
+          assert out.is_file() and out.stat().st_size < src.stat().st_size
+          print("DMG end-to-end compression OK:", src.stat().st_size, "->", out.stat().st_size)
+          '
+
+          hdiutil detach "$MOUNT_DIR"
 
       - name: Upload macOS artifact
         uses: actions/upload-artifact@v4
         with:
-          name: ${{ matrix.artifact }}
-          path: dist/${{ matrix.artifact }}
+          name: ${{ matrix.dmg_name }}
+          path: dist/${{ matrix.dmg_name }}
 
   release:
     name: Create GitHub Release
@@ -207,7 +462,7 @@ jobs:
           if [[ "${GITHUB_REF}" == refs/tags/* ]]; then
             TAG="${GITHUB_REF#refs/tags/}"
           else
-            TAG="${{ github.event.inputs.tag || 'v1.1.0' }}"
+            TAG="${{ github.event.inputs.tag || 'v1.1.1' }}"
           fi
           echo "tag=${TAG}" >> "$GITHUB_OUTPUT"
 
@@ -221,19 +476,21 @@ jobs:
 
             轻量、高清晰度 PDF 压缩工具，开箱即用，支持直接拖入 PDF 文件或文件夹（自动忽略其他格式），未指定输出目录时默认输出到源文件所在目录。
 
+            > **版权声明**：Copyright © 2026 唐学智 版权所有（保留所有权利）。
+
             ### 下载对应版本
 
-            | 系统 / 芯片 | 下载文件 | 使用方式 |
+            | 系统 / 芯片 | 下载文件 | 安装与使用方式 |
             |------------|----------|----------|
             | **Windows (64位)** | `PDF-Shrink-Windows-x64.exe` | 下载后直接双击运行 |
-            | **macOS Apple 芯片（M1/M2/M3/M4）** | `PDF-Shrink-macOS-AppleSilicon-arm64.zip` | 解压后将 `PDF Shrink.app` 拖入「应用程序」打开 |
-            | **macOS Intel 芯片** | `PDF-Shrink-macOS-Intel-x86_64.zip` | 解压后将 `PDF Shrink.app` 拖入「应用程序」打开 |
+            | **macOS Apple 芯片（M1/M2/M3/M4）** | `PDF-Shrink-macOS-AppleSilicon-arm64.dmg` | 双击 `.dmg`，将 `PDF Shrink.app` 拖入「应用程序」 |
+            | **macOS Intel 芯片** | `PDF-Shrink-macOS-Intel-x86_64.dmg` | 双击 `.dmg`，将 `PDF Shrink.app` 拖入「应用程序」 |
 
-            > **macOS 首次打开提示**：由于未购买 Apple 商业开发者签名证书，首次双击若提示“无法验证开发者/已损坏”，请**右键点击 `PDF Shrink.app` → 选择「打开」**，或在终端执行：
-            > ```bash
-            > xattr -cr "/Applications/PDF Shrink.app"
-            > ```
+            ### macOS 重要使用说明
+
+            1. **已通过 Apple 官方签名与公证**：直接双击 `.dmg`，将 `PDF Shrink.app` 拖入「应用程序」即可双击运行，无需额外放行设置。
+            2. **转发或存入网盘请直接传 `.dmg` 单文件**：切勿把安装好的 `PDF Shrink.app` 放进百度网盘同步空间、微信文件夹或经 Windows 中转，否则会丢失 macOS 应用内部的符号链接和可执行权限，导致应用损坏无法打开。
           files: |
             release-files/PDF-Shrink-Windows-x64.exe
-            release-files/PDF-Shrink-macOS-AppleSilicon-arm64.zip
-            release-files/PDF-Shrink-macOS-Intel-x86_64.zip
+            release-files/PDF-Shrink-macOS-AppleSilicon-arm64.dmg
+            release-files/PDF-Shrink-macOS-Intel-x86_64.dmg

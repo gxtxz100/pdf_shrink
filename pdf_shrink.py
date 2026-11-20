@@ -3,6 +3,8 @@
 """
 PDF Shrink — 轻量 PDF 压缩工具
 支持命令行与图形界面，支持拖入文件/文件夹，在体积与清晰度之间可调。
+
+Copyright © 2026 唐学智 版权所有
 """
 
 from __future__ import annotations
@@ -36,8 +38,10 @@ except ImportError:
 
 
 APP_NAME = "PDF Shrink"
-APP_VERSION = "1.1.0"
+APP_VERSION = "1.1.1"
 APP_EDITION = "广西瀛桂律师事务所专用版"
+APP_AUTHOR = "唐学智"
+APP_COPYRIGHT = "Copyright © 2026 唐学智 版权所有"
 
 # 预设：名称 -> (jpeg质量, 目标DPI, 说明)
 PRESETS = {
@@ -430,13 +434,18 @@ def _install_macos_dnd(
         return False
 
     try:
-        objc = ctypes.cdll.LoadLibrary(ctypes.util.find_library("objc"))
-        appkit = ctypes.cdll.LoadLibrary(
-            "/System/Library/Frameworks/AppKit.framework/AppKit"
+        objc_path = ctypes.util.find_library("objc") or "/usr/lib/libobjc.A.dylib"
+        appkit_path = (
+            ctypes.util.find_library("AppKit")
+            or "/System/Library/Frameworks/AppKit.framework/AppKit"
         )
-        ctypes.cdll.LoadLibrary(
-            "/System/Library/Frameworks/Foundation.framework/Foundation"
+        foundation_path = (
+            ctypes.util.find_library("Foundation")
+            or "/System/Library/Frameworks/Foundation.framework/Foundation"
         )
+        objc = ctypes.cdll.LoadLibrary(objc_path)
+        appkit = ctypes.cdll.LoadLibrary(appkit_path)
+        ctypes.cdll.LoadLibrary(foundation_path)
 
         objc.objc_getClass.argtypes = [ctypes.c_char_p]
         objc.objc_getClass.restype = ctypes.c_void_p
@@ -795,7 +804,7 @@ def _install_macos_dnd(
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         prog="pdf_shrink",
-        description=f"{APP_NAME} v{APP_VERSION} — 压缩 PDF，兼顾清晰度",
+        description=f"{APP_NAME} v{APP_VERSION} — 压缩 PDF，兼顾清晰度（{APP_COPYRIGHT}）",
     )
     parser.add_argument("inputs", nargs="*", help="PDF 文件或目录")
     parser.add_argument("-o", "--output", help="输出文件（单文件）或输出目录（批量）；留空则输出到源文件目录")
@@ -823,7 +832,12 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("-r", "--recursive", action="store_true", help="递归扫描目录中的 PDF")
     parser.add_argument("--suffix", default="_compressed", help="批量输出文件名后缀")
     parser.add_argument("--gui", action="store_true", help="启动图形界面")
-    parser.add_argument("-v", "--version", action="version", version=f"%(prog)s {APP_VERSION}")
+    parser.add_argument(
+        "-v",
+        "--version",
+        action="version",
+        version=f"%(prog)s {APP_VERSION} — {APP_COPYRIGHT}",
+    )
     return parser
 
 
@@ -931,8 +945,25 @@ def run_gui(initial_files: Optional[list[str]] = None) -> int:
 
     root = tkdnd_mod.Tk() if tkdnd_mod else tk.Tk()
     root.title(f"{APP_NAME} v{APP_VERSION} — {APP_EDITION}")
-    root.minsize(680, 580)
-    root.geometry("780x660")
+    root.minsize(680, 610)
+    root.geometry("780x690")
+
+    def show_about() -> None:
+        messagebox.showinfo(
+            f"关于 {APP_NAME}",
+            f"{APP_NAME} v{APP_VERSION}\n"
+            f"{APP_EDITION}\n\n"
+            "轻量、高清晰度 PDF 压缩工具，支持直接拖入 PDF 文件或文件夹。\n\n"
+            f"{APP_COPYRIGHT}\n"
+            f"作者：{APP_AUTHOR}｜保留所有权利。",
+            parent=root,
+        )
+
+    if sys.platform == "darwin":
+        try:
+            root.createcommand("tkAboutDialog", show_about)
+        except Exception:
+            pass
 
     files: list[Path] = []
     last_output_dir: Optional[Path] = None
@@ -942,9 +973,33 @@ def run_gui(initial_files: Optional[list[str]] = None) -> int:
     main.pack(fill=tk.BOTH, expand=True)
 
     # =======================================================================
-    # 布局策略：先 pack 底部固定区（操作栏 -> 进度日志 -> 选项），
-    # 再 pack 顶部可伸缩的文件列表区，确保「开始压缩」按钮在任何窗口尺寸下永不被遮挡。
+    # 布局策略：先 pack 底部固定区（版权栏 -> 操作栏 -> 进度日志 -> 选项），
+    # 再 pack 顶部可伸缩的文件列表区，确保「开始压缩」按钮与版权声明永不被遮挡。
     # =======================================================================
+
+    # ---- 0. 底部版权栏 ----
+    footer_wrap = ttk.Frame(main)
+    footer_wrap.pack(side=tk.BOTTOM, fill=tk.X, pady=(8, 0))
+    ttk.Separator(footer_wrap, orient=tk.HORIZONTAL).pack(fill=tk.X, pady=(0, 6))
+
+    footer_row = ttk.Frame(footer_wrap)
+    footer_row.pack(fill=tk.X)
+    ttk.Label(
+        footer_row,
+        text=f"{APP_EDITION}  v{APP_VERSION}",
+        foreground="#888888",
+        font=("", 10),
+    ).pack(side=tk.LEFT)
+
+    copyright_lbl = ttk.Label(
+        footer_row,
+        text=f"{APP_COPYRIGHT}（保留所有权利）",
+        foreground="#666666",
+        font=("", 10),
+        cursor="pointinghand" if sys.platform == "darwin" else "hand2",
+    )
+    copyright_lbl.pack(side=tk.RIGHT)
+    copyright_lbl.bind("<Button-1>", lambda _e: show_about())
 
     # ---- 1. 底部操作栏（永远固定在窗口底部可见）----
     action_row = ttk.Frame(main)
@@ -1472,14 +1527,49 @@ def run_gui(initial_files: Optional[list[str]] = None) -> int:
     if initial_files:
         root.after(50, lambda paths=list(initial_files): add_paths(paths, source="添加"))
 
+    if sys.platform == "darwin":
+        def _bring_to_front() -> None:
+            try:
+                root.deiconify()
+                root.lift()
+                root.focus_force()
+            except Exception:
+                pass
+
+        try:
+            root.createcommand("::tk::mac::ReopenApplication", _bring_to_front)
+        except Exception:
+            pass
+        root.after(60, _bring_to_front)
+
     root.mainloop()
     return 0
 
 
+def _strip_macos_launch_args(argv: list[str]) -> list[str]:
+    """过滤 macOS LaunchServices 启动 .app 时可能注入的系统参数。"""
+    cleaned: list[str] = []
+    i = 0
+    while i < len(argv):
+        arg = argv[i]
+        if arg.startswith("-psn_"):
+            i += 1
+            continue
+        if (
+            sys.platform == "darwin"
+            and getattr(sys, "frozen", False)
+            and (arg.startswith("-NS") or arg.startswith("-Apple"))
+        ):
+            # macOS 用户默认参数通常以 "-Key Value" 成对出现
+            i += 2 if (i + 1 < len(argv) and not argv[i + 1].startswith("-")) else 1
+            continue
+        cleaned.append(arg)
+        i += 1
+    return cleaned
+
+
 def main(argv: Optional[list[str]] = None) -> int:
-    raw_argv = list(sys.argv[1:] if argv is None else argv)
-    # 过滤 macOS LaunchServices 启动可能传入的 -psn_* 参数
-    raw_argv = [a for a in raw_argv if not a.startswith("-psn_")]
+    raw_argv = _strip_macos_launch_args(list(sys.argv[1:] if argv is None else argv))
 
     parser = build_parser()
     args = parser.parse_args(raw_argv)

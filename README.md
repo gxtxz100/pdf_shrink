@@ -2,7 +2,21 @@
 
 轻量 PDF 压缩工具：兼顾文件体积与清晰度，支持图形界面和命令行。
 
-## 安装
+## 打包成品下载（推荐）
+
+前往 GitHub Releases 页面下载对应系统成品：
+
+- **Windows (64位)**：`PDF-Shrink-Windows-x64.exe`（下载直接双击运行）
+- **macOS Apple 芯片（M1/M2/M3/M4）**：`PDF-Shrink-macOS-AppleSilicon-arm64.dmg`
+- **macOS Intel 芯片**：`PDF-Shrink-macOS-Intel-x86_64.dmg`
+
+### macOS 安装与首次打开说明
+
+1. 双击 `.dmg` 镜像，将 `PDF Shrink.app` 拖入旁边的 `Applications`（应用程序）文件夹即可。
+2. **如需存入百度网盘同步空间或通过微信转发给同事**：请直接保存/分享 `.dmg` 单文件，**切勿把解压/安装出来的 `.app` 文件夹直接放进网盘同步或经过 Windows 传输**，否则会丢失 macOS 应用内部的符号链接和可执行权限导致应用损坏无法打开。
+3. **正式版已通过 Apple Developer ID 签名与公证**，下载后可直接打开。如自行编译未公证版本并在 macOS 15 / 26 遇到安全提示，可在「系统设置 → 隐私与安全性」底部点击「仍要打开」，或在终端执行：`xattr -dr com.apple.quarantine "/Applications/PDF Shrink.app"`。
+
+## 源码运行（开发调试）
 
 ```bash
 cd pdf_shrink
@@ -77,6 +91,6 @@ python3 pdf_shrink.py a.pdf -g
 - **文字版 / 办公文档** → `smart`（智能压缩）
 - **扫描件 / 拍照 PDF** → `rebuild`（整页重绘）
 
-## 许可
+## 版权声明
 
-MIT
+Copyright © 2026 唐学智 版权所有（广西瀛桂律师事务所专用版，保留所有权利）。
