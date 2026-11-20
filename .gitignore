@@ -1,0 +1,12 @@
+__pycache__/
+*.pyc
+.Python
+.venv/
+venv/
+*.tmp
+.DS_Store
+build/
+dist/
+*.spec
+assets/
+samples/

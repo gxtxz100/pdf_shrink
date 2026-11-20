@@ -1,0 +1,239 @@
+name: Build & Release
+
+on:
+  push:
+    tags:
+      - "v*"
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Release tag (e.g. v1.1.0)"
+        required: false
+        default: "v1.1.0"
+
+permissions:
+  contents: write
+
+jobs:
+  build-windows:
+    name: Build Windows (x64 .exe)
+    runs-on: windows-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Python 3.12
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install dependencies
+        shell: pwsh
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt pyinstaller
+
+      - name: Generate icon
+        shell: pwsh
+        run: python scripts/make_icons.py
+
+      - name: Smoke test core compression & tkinterdnd2
+        shell: pwsh
+        run: |
+          python -c "import pymupdf, PIL, tkinterdnd2, pdf_shrink; print('Windows imports OK')"
+
+      - name: Build Windows single-file .exe
+        shell: pwsh
+        run: |
+          pyinstaller `
+            --noconfirm `
+            --clean `
+            --onefile `
+            --windowed `
+            --name "PDF-Shrink-Windows-x64" `
+            --icon "assets/icon.ico" `
+            --collect-all tkinterdnd2 `
+            --exclude-module pytest `
+            --exclude-module unittest `
+            --exclude-module pydoc `
+            --exclude-module doctest `
+            --exclude-module sqlite3 `
+            pdf_shrink.py
+
+      - name: Verify executable exists
+        shell: pwsh
+        run: |
+          $exe = Get-Item "dist/PDF-Shrink-Windows-x64.exe"
+          Write-Host "Built $($exe.Name): $([math]::Round($exe.Length / 1MB, 2)) MB"
+
+      - name: Upload Windows artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: PDF-Shrink-Windows-x64
+          path: dist/PDF-Shrink-Windows-x64.exe
+
+  build-macos:
+    name: Build macOS (${{ matrix.label }})
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - label: Apple Silicon (M芯片 arm64)
+            os: macos-15
+            arch: arm64
+            artifact: PDF-Shrink-macOS-AppleSilicon-arm64.zip
+          - label: Intel (x86_64)
+            os: macos-15-intel
+            arch: x86_64
+            artifact: PDF-Shrink-macOS-Intel-x86_64.zip
+    runs-on: ${{ matrix.os }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install python.org Python 3.12 (universal2 with macOS 11+ Tcl/Tk)
+        run: |
+          curl -fsSL -o /tmp/python-3.12.10-macos11.pkg https://www.python.org/ftp/python/3.12.10/python-3.12.10-macos11.pkg
+          sudo installer -pkg /tmp/python-3.12.10-macos11.pkg -target /
+          rm -f /tmp/python-3.12.10-macos11.pkg
+          /Library/Frameworks/Python.framework/Versions/3.12/bin/python3.12 -c "import platform, tkinter; print('arch:', platform.machine(), 'tk:', tkinter.TkVersion)"
+
+      - name: Create venv & install dependencies
+        run: |
+          /Library/Frameworks/Python.framework/Versions/3.12/bin/python3.12 -m venv .venv
+          source .venv/bin/activate
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt pyinstaller
+
+      - name: Generate icon
+        run: |
+          source .venv/bin/activate
+          python scripts/make_icons.py
+
+      - name: Smoke test core compression
+        run: |
+          source .venv/bin/activate
+          python -c "
+          import io, tempfile
+          from pathlib import Path
+          import pymupdf
+          from PIL import Image
+          import pdf_shrink
+
+          tmp = Path(tempfile.mkdtemp())
+          src = tmp / 'test.pdf'
+          doc = pymupdf.open()
+          img = Image.new('RGB', (1200, 1600), (240, 240, 240))
+          buf = io.BytesIO()
+          img.save(buf, format='JPEG', quality=95)
+          p = doc.new_page(width=595, height=842)
+          p.insert_image(p.rect, stream=buf.getvalue())
+          doc.save(src)
+          doc.close()
+
+          res = pdf_shrink.compress_pdf(src)
+          assert res.output_path.is_file()
+          print('Smoke test OK:', res.original_size, '->', res.compressed_size)
+          "
+
+      - name: Build macOS .app (${{ matrix.arch }})
+        run: |
+          source .venv/bin/activate
+          pyinstaller \
+            --noconfirm \
+            --clean \
+            --onedir \
+            --windowed \
+            --name "PDF Shrink" \
+            --icon "assets/icon.icns" \
+            --target-arch "${{ matrix.arch }}" \
+            --osx-bundle-identifier "cn.yinggui.pdfshrink" \
+            --exclude-module pytest \
+            --exclude-module unittest \
+            --exclude-module pydoc \
+            --exclude-module doctest \
+            --exclude-module sqlite3 \
+            pdf_shrink.py
+
+      - name: Configure Info.plist, verify arch, ad-hoc sign, and zip
+        run: |
+          PLIST="dist/PDF Shrink.app/Contents/Info.plist"
+          /usr/libexec/PlistBuddy -c "Add :CFBundleShortVersionString string 1.1.0" "$PLIST" 2>/dev/null || \
+            /usr/libexec/PlistBuddy -c "Set :CFBundleShortVersionString 1.1.0" "$PLIST"
+          /usr/libexec/PlistBuddy -c "Add :NSHighResolutionCapable bool true" "$PLIST" 2>/dev/null || \
+            /usr/libexec/PlistBuddy -c "Set :NSHighResolutionCapable true" "$PLIST"
+          /usr/libexec/PlistBuddy -c "Add :CFBundleDocumentTypes array" "$PLIST" 2>/dev/null || true
+          /usr/libexec/PlistBuddy -c "Add :CFBundleDocumentTypes:0 dict" "$PLIST" 2>/dev/null || true
+          /usr/libexec/PlistBuddy -c "Add :CFBundleDocumentTypes:0:CFBundleTypeName string PDF Document" "$PLIST" 2>/dev/null || true
+          /usr/libexec/PlistBuddy -c "Add :CFBundleDocumentTypes:0:CFBundleTypeRole string Viewer" "$PLIST" 2>/dev/null || true
+          /usr/libexec/PlistBuddy -c "Add :CFBundleDocumentTypes:0:LSItemContentTypes array" "$PLIST" 2>/dev/null || true
+          /usr/libexec/PlistBuddy -c "Add :CFBundleDocumentTypes:0:LSItemContentTypes:0 string com.adobe.pdf" "$PLIST" 2>/dev/null || true
+          /usr/libexec/PlistBuddy -c "Add :CFBundleDocumentTypes:0:LSItemContentTypes:1 string public.folder" "$PLIST" 2>/dev/null || true
+
+          echo "=== Verify binary architecture ==="
+          lipo -info "dist/PDF Shrink.app/Contents/MacOS/PDF Shrink"
+
+          echo "=== Ad-hoc code sign ==="
+          codesign --force --deep --sign - "dist/PDF Shrink.app"
+          codesign --verify --deep --strict "dist/PDF Shrink.app"
+
+          echo "=== Package zip ==="
+          ditto -c -k --sequesterRsrc --keepParent "dist/PDF Shrink.app" "dist/${{ matrix.artifact }}"
+          ls -lh "dist/${{ matrix.artifact }}"
+
+      - name: Upload macOS artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.artifact }}
+          path: dist/${{ matrix.artifact }}
+
+  release:
+    name: Create GitHub Release
+    needs: [build-windows, build-macos]
+    runs-on: ubuntu-latest
+    steps:
+      - name: Download all artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: release-files
+          merge-multiple: true
+
+      - name: List release files
+        run: ls -lh release-files
+
+      - name: Determine release tag
+        id: tag
+        run: |
+          if [[ "${GITHUB_REF}" == refs/tags/* ]]; then
+            TAG="${GITHUB_REF#refs/tags/}"
+          else
+            TAG="${{ github.event.inputs.tag || 'v1.1.0' }}"
+          fi
+          echo "tag=${TAG}" >> "$GITHUB_OUTPUT"
+
+      - name: Publish GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ steps.tag.outputs.tag }}
+          name: "PDF Shrink ${{ steps.tag.outputs.tag }}（广西瀛桂律师事务所专用版）"
+          body: |
+            ## PDF Shrink ${{ steps.tag.outputs.tag }} — 广西瀛桂律师事务所专用版
+
+            轻量、高清晰度 PDF 压缩工具，开箱即用，支持直接拖入 PDF 文件或文件夹（自动忽略其他格式），未指定输出目录时默认输出到源文件所在目录。
+
+            ### 下载对应版本
+
+            | 系统 / 芯片 | 下载文件 | 使用方式 |
+            |------------|----------|----------|
+            | **Windows (64位)** | `PDF-Shrink-Windows-x64.exe` | 下载后直接双击运行 |
+            | **macOS Apple 芯片（M1/M2/M3/M4）** | `PDF-Shrink-macOS-AppleSilicon-arm64.zip` | 解压后将 `PDF Shrink.app` 拖入「应用程序」打开 |
+            | **macOS Intel 芯片** | `PDF-Shrink-macOS-Intel-x86_64.zip` | 解压后将 `PDF Shrink.app` 拖入「应用程序」打开 |
+
+            > **macOS 首次打开提示**：由于未购买 Apple 商业开发者签名证书，首次双击若提示“无法验证开发者/已损坏”，请**右键点击 `PDF Shrink.app` → 选择「打开」**，或在终端执行：
+            > ```bash
+            > xattr -cr "/Applications/PDF Shrink.app"
+            > ```
+          files: |
+            release-files/PDF-Shrink-Windows-x64.exe
+            release-files/PDF-Shrink-macOS-AppleSilicon-arm64.zip
+            release-files/PDF-Shrink-macOS-Intel-x86_64.zip
